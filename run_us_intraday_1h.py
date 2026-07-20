@@ -1,5 +1,6 @@
 """
-US Market — Intraday 1h, Single TF vs Multi TF (1h + Daily PDI>MDI)
+US Market — Intraday 1h
+Compare: Standard vs Multi-TF (daily PDI>MDI) vs Modif (daily PDI>MDI + PDI>PDI[1])
 1 year data
 """
 import os, sys, numpy as np, pandas as pd, yfinance as yf, time, warnings
@@ -43,21 +44,30 @@ def load(ticker):
         if isinstance(d.columns, pd.MultiIndex): d.columns = d.columns.get_level_values(0)
         dc = d['Close'].values.astype(float); dh = d['High'].values.astype(float); dl = d['Low'].values.astype(float)
         _, dp, dm = calc_i(dc, dh, dl)
+        dp_1ago = np.full_like(dp, np.nan); dm_1ago = np.full_like(dm, np.nan)
+        if len(dp) > 1:
+            dp_1ago[1:] = dp[:-1]; dm_1ago[1:] = dm[:-1]
+        
         d_dates = d.index; d_map = {}
-        for i, dd in enumerate(d_dates): d_map[dd] = {'pdi': dp[i], 'mdi': dm[i]}
+        for i, dd in enumerate(d_dates):
+            d_map[dd] = {'pdi': dp[i], 'mdi': dm[i], 'pdi1': dp_1ago[i], 'mdi1': dm_1ago[i]}
         def get_d(dt):
             for dd in reversed(d_dates):
                 if dd <= dt.tz_localize(None): return d_map.get(dd, {})
             return {}
         h1d = h1.index; hp = np.full(len(h1d), np.nan); hm = np.full(len(h1d), np.nan)
+        hp1 = np.full(len(h1d), np.nan); hm1 = np.full(len(h1d), np.nan)
         for i, dt in enumerate(h1d):
             w = get_d(dt); hp[i] = w.get('pdi', np.nan); hm[i] = w.get('mdi', np.nan)
+            hp1[i] = w.get('pdi1', np.nan); hm1[i] = w.get('mdi1', np.nan)
         r['d_pdi'] = hp; r['d_mdi'] = hm
+        r['d_pdi_1ago'] = hp1; r['d_mdi_1ago'] = hm1
         return r
     except:
         return None
 
-def buy_sig(s, bar, multi=False):
+def buy_sig(s, bar, mode=0):
+    """mode=0: Standard, mode=1: Multi-TF (daily PDI>MDI), mode=2: Modif (+ daily PDI>PDI[1])"""
     if bar < 20 or bar >= len(s['close']): return False
     for k in ['adx','pdi','mdi','sma20','sl']:
         if np.isnan(s[k][bar]): return False
@@ -65,14 +75,22 @@ def buy_sig(s, bar, multi=False):
     a, p, m = float(s['adx'][bar]), float(s['pdi'][bar]), float(s['mdi'][bar])
     if not (l > sl and c > sm and a > MIN_ADX and p > m): return False
     if bar >= 5 and not (p > float(s['pdi'][bar-5])): return False
-    if multi:
+    
+    if mode >= 1:  # Multi-TF: daily PDI > daily MDI
         dp = float(s['d_pdi'][bar]) if not np.isnan(s['d_pdi'][bar]) else None
         dm = float(s['d_mdi'][bar]) if not np.isnan(s['d_mdi'][bar]) else None
         if dp is None or dm is None or not (dp > dm): return False
+    
+    if mode >= 2:  # Modif: also daily PDI > daily PDI[1]
+        dp1 = float(s['d_pdi_1ago'][bar]) if not np.isnan(s['d_pdi_1ago'][bar]) else None
+        dp = float(s['d_pdi'][bar]) if not np.isnan(s['d_pdi'][bar]) else None
+        if dp is None or dp1 is None or not (dp > dp1): return False
+    
     return True
 
-def run(stocks, multi=False):
-    lbl = "Multi TF" if multi else "Single TF"
+def run(stocks, mode=0):
+    labels = {0: "Single TF", 1: "Multi TF (daily PDI>MDI)", 2: "Modif (daily PDI>MDI + rising)"}
+    lbl = labels.get(mode, f"Mode {mode}")
     print(f"\n  {lbl}...")
     all_d = set()
     for t, s in stocks.items():
@@ -104,7 +122,7 @@ def run(stocks, multi=False):
                 if any(p['ticker']==t for p in pos): continue
                 b = si[t].get(td)
                 if b is None or b < 20: continue
-                if not buy_sig(s, b, multi): continue
+                if not buy_sig(s, b, mode): continue
                 cl = float(s['close'][b]); slv = float(s['sl'][b])
                 sc = sum(1 for j in range(max(0,b-100),b+1) if not np.isnan(s['adx'][j]) and not np.isnan(s['sma20'][j]) and s['adx'][j]>25 and s['close'][j]>s['sma20'][j])
                 cand.append({'t':t,'sc':sc,'cl':cl,'sl':slv})
@@ -133,7 +151,6 @@ def run(stocks, multi=False):
         r['sharpe'] = np.sqrt(252*7)*dr.mean()/dr.std() if dr.std()>0 else 0
     return r
 
-print("US — Intraday 1h: Single vs Multi TF (1 year)")
 print(f"Loading {len(tickers)} stocks...")
 stocks = {}
 for i, t in enumerate(tickers):
@@ -142,15 +159,29 @@ for i, t in enumerate(tickers):
     if (i+1)%20==0: print(f"  [{i+1}/{len(tickers)}] ({len(stocks)} valid)")
 print(f"Loaded: {len(stocks)} stocks")
 
-for multi in [False, True]:
-    r = run(stocks, multi)
-    label = "Multi TF (1h + Daily PDI>MDI)" if multi else "Single TF (1h only)"
-    print(f"\n{'='*40}")
-    print(f"  {label}")
-    print(f"{'='*40}")
-    print(f"  Return   : {r['ret']:+.2f}%")
-    print(f"  Sharpe   : {r.get('sharpe',0):.2f}")
-    print(f"  Max DD   : -{r.get('dd',0):.2f}%")
-    print(f"  Trades   : {r['n']} | WR: {r.get('wr',0):.1f}%")
-    print(f"  Best/Worst: +{r.get('best',0):.2f}% / {r.get('worst',0):.2f}%")
-    print()
+results = {}
+for mode in [0, 1, 2]:
+    results[mode] = run(stocks, mode)
+
+print(f"\n\n{'='*60}")
+print(f"  📊 PERBANDINGAN — US Intraday 1h")
+print(f"{'='*60}")
+print(f"  {'Metric':<20} {'SINGLE TF':>12} {'MULTI-TF':>12} {'MODIF':>12}")
+print(f"  {'-'*20} {'-'*12} {'-'*12} {'-'*12}")
+for metric, key, fmt in [
+    ("Return %", "ret", "{:+.2f}%"),
+    ("Sharpe", "sharpe", "{:.2f}"),
+    ("Max DD %", "dd", "-{:.2f}%"),
+    ("Trades", "n", "{:d}"),
+    ("Win Rate %", "wr", "{:.1f}%"),
+    ("Profit Factor", "pf", "{:.2f}"),
+    ("Best %", "best", "+{:.2f}%"),
+    ("Worst %", "worst", "{:.2f}%"),
+]:
+    vals = [results[m].get(key, 0) for m in [0, 1, 2]]
+    if key in ("n",):
+        print(f"  {metric:<20} {fmt.format(int(vals[0])):>12} {fmt.format(int(vals[1])):>12} {fmt.format(int(vals[2])):>12}")
+    elif key in ("dd",):
+        print(f"  {metric:<20} {fmt.format(abs(vals[0])):>12} {fmt.format(abs(vals[1])):>12} {fmt.format(abs(vals[2])):>12}")
+    else:
+        print(f"  {metric:<20} {fmt.format(vals[0]):>12} {fmt.format(vals[1]):>12} {fmt.format(vals[2]):>12}")
